@@ -8,6 +8,7 @@ import asyncio
 import aiohttp
 import logging
 import os
+import json
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
@@ -28,6 +29,8 @@ CSGOEMPIRE_API_KEY  = os.getenv("CSGOEMPIRE_API_KEY", "")
 GAMMA_API_BASE      = "https://gamma-api.polymarket.com"
 CSGOEMPIRE_API_BASE = "https://csgoempire.com/api/v2"
 
+MIN_POLY_VOLUME     = float(os.getenv("MIN_POLY_VOLUME", "10000"))
+MIN_POLY_LIQUIDITY  = float(os.getenv("MIN_POLY_LIQUIDITY", "10000"))
 MIN_EDGE            = 0.04
 POLY_FEE            = 0.02
 EMPIRE_FEE          = 0.05
@@ -40,6 +43,8 @@ class PolyMarket:
     question: str
     yes_price: float
     no_price: float
+    volume: float
+    liquidity: float
     url: str = ""
 
 @dataclass
@@ -74,13 +79,15 @@ class PolymarketClient:
         limit = 100
         page = 0
 
-        while page < 5:
+        while page < 10:
             page += 1
             params = {
                 "active": "true",
                 "closed": "false",
                 "limit": limit,
                 "offset": offset,
+                "order": "volume24hr",
+                "ascending": "false",
             }
 
             try:
@@ -103,21 +110,23 @@ class PolymarketClient:
             if not raw:
                 break
 
-            if page == 1 and raw:
-                logger.info(f"Gamma campos disponíveis: {list(raw[0].keys())}")
-
             for m in raw:
                 try:
-                    # Preços dos outcomes YES/NO
+                    # Campos confirmados pela Gamma API
+                    volume    = float(m.get("volume24hr") or m.get("volumeNum") or m.get("volume") or 0)
+                    liquidity = float(m.get("liquidityNum") or m.get("liquidity") or 0)
+
+                    if volume < MIN_POLY_VOLUME or liquidity < MIN_POLY_LIQUIDITY:
+                        continue
+
+                    # outcomePrices pode ser lista ou string JSON
                     outcome_prices = m.get("outcomePrices")
+                    if isinstance(outcome_prices, str):
+                        outcome_prices = json.loads(outcome_prices)
+
                     if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
                         yes_price = float(outcome_prices[0])
                         no_price  = float(outcome_prices[1])
-                    elif isinstance(outcome_prices, str):
-                        import json
-                        prices = json.loads(outcome_prices)
-                        yes_price = float(prices[0])
-                        no_price  = float(prices[1])
                     else:
                         yes_price = float(m.get("bestAsk") or m.get("lastTradePrice") or 0)
                         no_price  = round(1 - yes_price, 4) if yes_price > 0 else 0
@@ -131,6 +140,8 @@ class PolymarketClient:
                         question=m.get("question", m.get("title", "")),
                         yes_price=yes_price,
                         no_price=no_price,
+                        volume=volume,
+                        liquidity=liquidity,
                         url=f"https://polymarket.com/event/{slug}",
                     ))
                 except Exception as e:
@@ -141,7 +152,7 @@ class PolymarketClient:
                 break
             offset += limit
 
-        logger.info(f"Polymarket: {len(markets)} mercados encontrados")
+        logger.info(f"Polymarket: {len(markets)} mercados elegíveis (vol>={MIN_POLY_VOLUME}, liq>={MIN_POLY_LIQUIDITY})")
         return markets
 
 # ─── CSGOEMPIRE CLIENT ────────────────────────────────────────────────────────
@@ -196,6 +207,10 @@ class CSGOEmpireClient:
         return events
 
     def _mock_events(self) -> list[EmpireEvent]:
+        """
+        Eventos de teste — baseados em jogos que provavelmente existem na Polymarket.
+        Substitui por dados reais quando tiveres acesso à API do Empire.
+        """
         return [
             EmpireEvent("1", "Manchester City", "Arsenal",    2.10, 3.50, 3.20, "football"),
             EmpireEvent("2", "Real Madrid",     "Barcelona",  2.40, 2.90, 3.10, "football"),
@@ -203,25 +218,59 @@ class CSGOEmpireClient:
             EmpireEvent("4", "FaZe",            "G2",         2.20, 1.70, None, "csgo"),
             EmpireEvent("5", "Lakers",          "Celtics",    2.05, 1.80, None, "basketball"),
             EmpireEvent("6", "PSG",             "Bayern",     2.60, 2.70, 3.30, "football"),
+            EmpireEvent("7", "Liverpool",       "Chelsea",    1.90, 4.00, 3.50, "football"),
+            EmpireEvent("8", "Astralis",        "Liquid",     2.10, 1.75, None, "csgo"),
+            EmpireEvent("9", "Warriors",        "Heat",       1.95, 1.90, None, "basketball"),
+            EmpireEvent("10","Atletico",        "Sevilla",    2.20, 3.10, 3.00, "football"),
+            EmpireEvent("11","Cloud9",          "NaVi",       2.50, 1.60, None, "csgo"),
+            EmpireEvent("12","Juventus",        "Inter",      2.30, 3.00, 3.20, "football"),
         ]
 
 # ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
+def _match_teams(question: str, team_a: str, team_b: str) -> bool:
+    """
+    Verifica se os nomes das equipas aparecem na pergunta do Polymarket.
+    Usa múltiplas estratégias: nome completo, palavras individuais, abreviações.
+    """
+    q = question.lower()
+    a = team_a.lower()
+    b = team_b.lower()
+
+    def team_in_q(team: str) -> bool:
+        if team in q:
+            return True
+        # palavras com mais de 3 letras
+        words = [w for w in team.split() if len(w) > 3]
+        if any(w in q for w in words):
+            return True
+        # primeira palavra (ex: "Manchester" de "Manchester City")
+        first = team.split()[0]
+        if len(first) > 3 and first in q:
+            return True
+        return False
+
+    return team_in_q(a) and team_in_q(b)
+
 def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
     alerts = []
+    matched_questions = []
+
     for poly in poly_markets:
         q = poly.question.lower()
         for ev in empire_events:
-            a = ev.team_a.lower()
-            b = ev.team_b.lower()
-            words_a = [w for w in a.split() if len(w) > 3]
-            words_b = [w for w in b.split() if len(w) > 3]
-            match_a = a in q or any(w in q for w in words_a)
-            match_b = b in q or any(w in q for w in words_b)
-            if not (match_a and match_b):
+            if not _match_teams(poly.question, ev.team_a, ev.team_b):
                 continue
 
-            pos_a = q.find(words_a[0]) if words_a and words_a[0] in q else 999
-            pos_b = q.find(words_b[0]) if words_b and words_b[0] in q else 999
+            matched_questions.append(poly.question)
+
+            a = ev.team_a.lower()
+            words_a = [w for w in a.split() if len(w) > 3]
+            pos_a = next((q.find(w) for w in words_a if w in q), 999)
+
+            b = ev.team_b.lower()
+            words_b = [w for w in b.split() if len(w) > 3]
+            pos_b = next((q.find(w) for w in words_b if w in q), 999)
+
             yes_is_team_a = pos_a <= pos_b
 
             for poly_side, poly_price, empire_side, empire_odds in [
@@ -240,6 +289,11 @@ def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
                     poly_price=poly_price, empire_odds=empire_odds,
                     empire_implied=empire_implied, edge=net_edge,
                 ))
+
+    if matched_questions:
+        logger.info(f"Mercados com match: {matched_questions[:5]}")
+    else:
+        logger.info("Nenhum match encontrado entre Polymarket e Empire")
 
     alerts.sort(key=lambda a: a.edge, reverse=True)
     logger.info(f"Oportunidades encontradas: {len(alerts)}")
@@ -272,6 +326,7 @@ class Telegram:
             f"📊 <b>Polymarket</b>\n"
             f"  ❓ {alert.poly_market.question}\n"
             f"  🎯 Apostar <b>{alert.poly_side}</b> @ <b>{alert.poly_price:.3f}</b> ({alert.poly_price:.1%})\n"
+            f"  💰 Vol 24h: <b>${alert.poly_market.volume:,.0f}</b> | Liq: <b>${alert.poly_market.liquidity:,.0f}</b>\n"
             f"  🔗 {alert.poly_market.url}\n\n"
             f"🎮 <b>CSGOEmpire</b>\n"
             f"  ⚔️ {alert.empire_event.team_a} vs {alert.empire_event.team_b}\n"
@@ -301,6 +356,7 @@ class ArbBot:
             await tg.send(
                 f"🤖 <b>Arbitrage Monitor Iniciado</b>\n"
                 f"⚠️ Modo: Só Alertas — trades manuais\n"
+                f"📊 Vol mínimo: ${MIN_POLY_VOLUME:,.0f}\n"
                 f"💹 Edge mínimo: {MIN_EDGE:.0%}\n"
                 f"🔄 Scan a cada {SCAN_INTERVAL}s"
             )
