@@ -37,8 +37,7 @@ MIN_POLY_LIQUIDITY   = 10_000   # USD — mínimo de liquidez exigida
 MIN_ARB_EDGE         = 0.04     # 4% edge mínimo após fees
 POLY_FEE             = 0.02     # 2% fee Polymarket
 EMPIRE_FEE           = 0.05     # 5% fee CSGOEmpire (ajusta conforme o teu tier)
-SCAN_INTERVAL        = 10      # segundos entre scans
-DEBUG_MODE           = True     # mostra logs detalhados
+SCAN_INTERVAL        = 60       # segundos entre scans
 MAX_AUTO_BET_USD     = float(os.getenv("MAX_AUTO_BET_USD", "50"))  # cap por trade automático
 
 # Tags de mercados a monitorizar (Polymarket usa tags/categorias)
@@ -89,9 +88,9 @@ class PolymarketClient:
         """Busca mercados ativos com volume e liquidez mínimos."""
         markets = []
         next_cursor = None
+        logger.info("A contactar Polymarket API...")
 
         while True:
-            logger.info("A contactar Polymarket API...")
             params = {
                 "active": "true",
                 "closed": "false",
@@ -102,14 +101,20 @@ class PolymarketClient:
 
             try:
                 async with self.session.get(
-                    f"{POLYMARKET_API_BASE}/markets", params=params, timeout=aiohttp.ClientTimeout(total=15)
+                    f"{POLYMARKET_API_BASE}/markets", params=params,
+                    timeout=aiohttp.ClientTimeout(total=10, connect=5)
                 ) as resp:
+                    logger.info(f"Polymarket resposta: HTTP {resp.status}")
                     if resp.status != 200:
                         logger.warning(f"Polymarket API error: {resp.status}")
                         break
                     data = await resp.json()
+                    logger.info(f"Polymarket pagina recebida: {len(data.get('data', []))} mercados")
+            except asyncio.TimeoutError:
+                logger.error("Polymarket timeout — Railway pode estar a bloquear requests externos")
+                break
             except Exception as e:
-                logger.error(f"Polymarket fetch error: {e}")
+                logger.error(f"Polymarket fetch error: {type(e).__name__}: {e}")
                 break
 
             raw_markets = data.get("data", [])
@@ -455,4 +460,3 @@ class ArbBot:
 
 if __name__ == "__main__":
     asyncio.run(ArbBot().run())
-
