@@ -38,6 +38,7 @@ MIN_ARB_EDGE         = 0.04     # 4% edge mínimo após fees
 POLY_FEE             = 0.02     # 2% fee Polymarket
 EMPIRE_FEE           = 0.05     # 5% fee CSGOEmpire (ajusta conforme o teu tier)
 SCAN_INTERVAL        = 10      # segundos entre scans
+DEBUG_MODE           = True     # mostra logs detalhados
 MAX_AUTO_BET_USD     = float(os.getenv("MAX_AUTO_BET_USD", "50"))  # cap por trade automático
 
 # Tags de mercados a monitorizar (Polymarket usa tags/categorias)
@@ -90,6 +91,7 @@ class PolymarketClient:
         next_cursor = None
 
         while True:
+            logger.info("A contactar Polymarket API...")
             params = {
                 "active": "true",
                 "closed": "false",
