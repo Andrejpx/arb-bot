@@ -1,7 +1,7 @@
 """
 Arbitrage Monitor Bot — Polymarket <-> CSGOEmpire
-Compara odds entre as duas plataformas e envia alertas via Telegram.
-Sem execução automática — trades feitos manualmente.
+Só mercados de Sports e Esports — partidas individuais e futures.
+Alertas via Telegram — trades manuais.
 """
 
 import asyncio
@@ -29,10 +29,26 @@ CSGOEMPIRE_API_KEY  = os.getenv("CSGOEMPIRE_API_KEY", "")
 GAMMA_API_BASE      = "https://gamma-api.polymarket.com"
 CSGOEMPIRE_API_BASE = "https://csgoempire.com/api/v2"
 
-MIN_EDGE     = 0.04
-POLY_FEE     = 0.02
-EMPIRE_FEE   = 0.05
+MIN_EDGE      = 0.04
+POLY_FEE      = 0.02
+EMPIRE_FEE    = 0.05
 SCAN_INTERVAL = 30
+
+# Slugs de desporto da Polymarket (retirados diretamente do site)
+SPORT_SLUGS = [
+    # Esports
+    "counter-strike", "dota-2", "league-of-legends", "valorant",
+    "call-of-duty", "rainbow-six-siege",
+    # Futebol
+    "epl", "ucl", "laliga", "bundesliga", "sea", "ligue-1",
+    "mls", "por", "uel",
+    # Basketball
+    "nba",
+    # Tennis
+    "atp", "wta",
+    # Hockey
+    "nhl",
+]
 
 # ─── DATA CLASSES ─────────────────────────────────────────────────────────────
 @dataclass
@@ -69,22 +85,16 @@ class PolymarketClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    async def get_markets(self) -> list[PolyMarket]:
-        markets = []
-        offset = 0
-        limit = 100
-        page = 0
-
-        while page < 10:
-            page += 1
+    async def _fetch_slug(self, slug: str) -> list[dict]:
+        results = []
+        for offset in range(0, 500, 100):
             params = {
                 "active": "true",
                 "closed": "false",
-                "limit": limit,
+                "limit": 100,
                 "offset": offset,
-                # sem filtro de tag — filtramos por keywords depois
+                "sport_slug": slug,
             }
-
             try:
                 async with self.session.get(
                     f"{GAMMA_API_BASE}/markets",
@@ -92,80 +102,68 @@ class PolymarketClient:
                     timeout=aiohttp.ClientTimeout(total=10, connect=5)
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning(f"Polymarket HTTP {resp.status}")
                         break
                     raw = await resp.json()
-            except asyncio.TimeoutError:
-                logger.error("Polymarket timeout")
-                break
+                    if not raw:
+                        break
+                    results.extend(raw)
+                    if len(raw) < 100:
+                        break
             except Exception as e:
-                logger.error(f"Polymarket erro: {e}")
+                logger.debug(f"Erro slug={slug}: {e}")
                 break
+        return results
 
-            if not raw:
-                break
+    async def get_markets(self) -> list[PolyMarket]:
+        # Buscar todos os slugs em paralelo
+        tasks = [self._fetch_slug(slug) for slug in SPORT_SLUGS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Log das primeiras 10 perguntas para diagnóstico
-            if page == 1:
-                questions = [m.get("question", "") for m in raw[:10]]
-                logger.info(f"Primeiras perguntas Polymarket: {questions}")
-                tags_sample = list(set(t for m in raw[:20] for t in (m.get("tags") or [])))
-                logger.info(f"Tags disponíveis: {tags_sample[:20]}")
+        seen_ids = set()
+        all_raw = []
+        for r in results:
+            if isinstance(r, list):
+                for m in r:
+                    mid = str(m.get("id") or m.get("conditionId", ""))
+                    if mid and mid not in seen_ids:
+                        seen_ids.add(mid)
+                        all_raw.append(m)
 
-            for m in raw:
-                try:
-                    outcome_prices = m.get("outcomePrices")
-                    if isinstance(outcome_prices, str):
-                        outcome_prices = json.loads(outcome_prices)
+        logger.info(f"Polymarket: {len(all_raw)} mercados Sports/Esports brutos")
 
-                    if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
-                        yes_price = float(outcome_prices[0])
-                        no_price  = float(outcome_prices[1])
-                    else:
-                        yes_price = float(m.get("bestAsk") or m.get("lastTradePrice") or 0)
-                        no_price  = round(1 - yes_price, 4) if yes_price > 0 else 0
+        if all_raw:
+            questions = [m.get("question", "") for m in all_raw[:10]]
+            logger.info(f"Exemplos: {questions}")
 
-                    if yes_price <= 0 or no_price <= 0:
-                        continue
+        markets = []
+        for m in all_raw:
+            try:
+                outcome_prices = m.get("outcomePrices")
+                if isinstance(outcome_prices, str):
+                    outcome_prices = json.loads(outcome_prices)
 
-                    # Filtrar por keywords desportivas na pergunta ou tags
-                    question_lower = m.get("question", "").lower()
-                    market_tags = [t.lower() for t in (m.get("tags") or [])]
-                    sport_keywords = [
-                        "win", "beat", "match", "game", "vs", "versus",
-                        "final", "champion", "league", "cup", "playoff",
-                        "nba", "nfl", "nhl", "mlb", "epl", "ucl",
-                        "soccer", "football", "basketball", "tennis", "golf",
-                        "esport", "cs2", "csgo", "dota", "valorant", "lol",
-                        "series", "tournament", "title", "score",
-                    ]
-                    sport_tags = ["sports", "esports", "soccer", "basketball",
-                                  "football", "tennis", "cs2", "csgo", "nba",
-                                  "nfl", "mls", "nhl", "baseball"]
-                    is_sport = (
-                        any(k in question_lower for k in sport_keywords)
-                        or any(t in market_tags for t in sport_tags)
-                    )
-                    if not is_sport:
-                        continue
+                if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+                    yes_price = float(outcome_prices[0])
+                    no_price  = float(outcome_prices[1])
+                else:
+                    yes_price = float(m.get("bestAsk") or m.get("lastTradePrice") or 0)
+                    no_price  = round(1 - yes_price, 4) if yes_price > 0 else 0
 
-                    slug = m.get("slug", str(m.get("id", "")))
-                    markets.append(PolyMarket(
-                        condition_id=str(m.get("conditionId", m.get("id", ""))),
-                        question=m.get("question", m.get("title", "")),
-                        yes_price=yes_price,
-                        no_price=no_price,
-                        url=f"https://polymarket.com/event/{slug}",
-                    ))
-                except Exception as e:
-                    logger.debug(f"Mercado ignorado: {e}")
+                if yes_price <= 0 or no_price <= 0:
                     continue
 
-            if len(raw) < limit:
-                break
-            offset += limit
+                slug = m.get("slug", str(m.get("id", "")))
+                markets.append(PolyMarket(
+                    condition_id=str(m.get("conditionId", m.get("id", ""))),
+                    question=m.get("question", m.get("title", "")),
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    url=f"https://polymarket.com/event/{slug}",
+                ))
+            except Exception as e:
+                logger.debug(f"Mercado ignorado: {e}")
 
-        logger.info(f"Polymarket: {len(markets)} mercados encontrados")
+        logger.info(f"Polymarket: {len(markets)} mercados com preços válidos")
         return markets
 
 # ─── CSGOEMPIRE CLIENT ────────────────────────────────────────────────────────
@@ -220,39 +218,40 @@ class CSGOEmpireClient:
         return events
 
     def _mock_events(self) -> list[EmpireEvent]:
+        """Eventos de teste baseados nos jogos disponíveis hoje na Polymarket."""
         return [
-            EmpireEvent("1", "Manchester City", "Arsenal",    2.10, 3.50, 3.20, "football"),
-            EmpireEvent("2", "Real Madrid",     "Barcelona",  2.40, 2.90, 3.10, "football"),
-            EmpireEvent("3", "Vitality",        "NAVI",       1.85, 2.00, None, "csgo"),
-            EmpireEvent("4", "FaZe",            "G2",         2.20, 1.70, None, "csgo"),
-            EmpireEvent("5", "Lakers",          "Celtics",    2.05, 1.80, None, "basketball"),
-            EmpireEvent("6", "PSG",             "Bayern",     2.60, 2.70, 3.30, "football"),
-            EmpireEvent("7", "Liverpool",       "Chelsea",    1.90, 4.00, 3.50, "football"),
-            EmpireEvent("8", "Astralis",        "Liquid",     2.10, 1.75, None, "csgo"),
-            EmpireEvent("9", "Warriors",        "Heat",       1.95, 1.90, None, "basketball"),
-            EmpireEvent("10","Atletico",        "Sevilla",    2.20, 3.10, 3.00, "football"),
-            EmpireEvent("11","Cloud9",          "NaVi",       2.50, 1.60, None, "csgo"),
-            EmpireEvent("12","Juventus",        "Inter",      2.30, 3.00, 3.20, "football"),
+            # Futebol
+            EmpireEvent("1",  "Fluminense",       "Vasco da Gama",    2.80, 2.50, 3.20, "football"),
+            EmpireEvent("2",  "Ferencvaros",       "Braga",            2.40, 2.90, 3.10, "football"),
+            EmpireEvent("3",  "Nottingham Forest", "Midtjylland",      1.80, 4.50, 3.80, "football"),
+            EmpireEvent("4",  "Bologna",           "Roma",             2.60, 2.70, 3.30, "football"),
+            EmpireEvent("5",  "Celta Vigo",        "Lyon",             2.20, 3.10, 3.00, "football"),
+            # Basketball
+            EmpireEvent("6",  "Rhode Island",      "Duquesne",         1.50, 2.60, None, "basketball"),
+            EmpireEvent("7",  "Nevada",            "Grand Canyon",     3.50, 1.35, None, "basketball"),
+            EmpireEvent("8",  "Ohio",              "Kent State",       1.80, 2.10, None, "basketball"),
+            # Tennis
+            EmpireEvent("9",  "Andreescu",         "Jones",            1.35, 3.20, None, "tennis"),
+            EmpireEvent("10", "Svitolina",         "Swiatek",          1.65, 2.30, None, "tennis"),
+            EmpireEvent("11", "Tien",              "Sinner",           3.80, 1.25, None, "tennis"),
+            # Esports CS2
+            EmpireEvent("12", "Vitality",          "NAVI",             1.85, 2.00, None, "csgo"),
+            EmpireEvent("13", "FaZe",              "G2",               2.20, 1.70, None, "csgo"),
+            EmpireEvent("14", "Astralis",          "Liquid",           2.10, 1.75, None, "csgo"),
+            # Dota 2
+            EmpireEvent("15", "Aurora",            "Team Yandex",      2.10, 1.75, None, "dota2"),
+            EmpireEvent("16", "Team Liquid",       "Tundra",           1.90, 1.95, None, "dota2"),
         ]
 
 # ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
-def _match_teams(question: str, team_a: str, team_b: str) -> bool:
+def _team_in_question(team: str, question: str) -> bool:
     q = question.lower()
-    a = team_a.lower()
-    b = team_b.lower()
-
-    def team_in_q(team: str) -> bool:
-        if team in q:
-            return True
-        words = [w for w in team.split() if len(w) > 3]
-        if any(w in q for w in words):
-            return True
-        first = team.split()[0]
-        if len(first) > 3 and first in q:
-            return True
-        return False
-
-    return team_in_q(a) and team_in_q(b)
+    t = team.lower()
+    if t in q:
+        return True
+    # Palavras com mais de 3 letras
+    words = [w for w in t.split() if len(w) > 3]
+    return any(w in q for w in words)
 
 def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
     alerts = []
@@ -261,16 +260,15 @@ def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
     for poly in poly_markets:
         q = poly.question.lower()
         for ev in empire_events:
-            if not _match_teams(poly.question, ev.team_a, ev.team_b):
+            if not (_team_in_question(ev.team_a, poly.question) and
+                    _team_in_question(ev.team_b, poly.question)):
                 continue
 
             matched.append(poly.question)
-            a = ev.team_a.lower()
-            b = ev.team_b.lower()
-            words_a = [w for w in a.split() if len(w) > 3]
-            words_b = [w for w in b.split() if len(w) > 3]
-            pos_a = next((q.find(w) for w in words_a if w in q), 999)
-            pos_b = next((q.find(w) for w in words_b if w in q), 999)
+            a_words = [w for w in ev.team_a.lower().split() if len(w) > 3]
+            b_words = [w for w in ev.team_b.lower().split() if len(w) > 3]
+            pos_a = next((q.find(w) for w in a_words if w in q), 999)
+            pos_b = next((q.find(w) for w in b_words if w in q), 999)
             yes_is_team_a = pos_a <= pos_b
 
             for poly_side, poly_price, empire_side, empire_odds in [
@@ -291,9 +289,9 @@ def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
                 ))
 
     if matched:
-        logger.info(f"Mercados com match: {matched[:5]}")
+        logger.info(f"Mercados com match ({len(matched)}): {matched[:5]}")
     else:
-        logger.info("Nenhum match — os eventos mock não correspondem aos mercados atuais")
+        logger.info("Nenhum match encontrado")
 
     alerts.sort(key=lambda a: a.edge, reverse=True)
     logger.info(f"Oportunidades encontradas: {len(alerts)}")
@@ -355,6 +353,7 @@ class ArbBot:
             await tg.send(
                 f"🤖 <b>Arbitrage Monitor Iniciado</b>\n"
                 f"⚠️ Modo: Só Alertas — trades manuais\n"
+                f"🏆 Categorias: Futebol, Basketball, Tennis, NHL, CS2, Dota2, Valorant\n"
                 f"💹 Edge mínimo: {MIN_EDGE:.0%}\n"
                 f"🔄 Scan a cada {SCAN_INTERVAL}s"
             )
