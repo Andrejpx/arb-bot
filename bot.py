@@ -37,7 +37,7 @@ MIN_POLY_LIQUIDITY   = 10_000   # USD — mínimo de liquidez exigida
 MIN_ARB_EDGE         = 0.04     # 4% edge mínimo após fees
 POLY_FEE             = 0.02     # 2% fee Polymarket
 EMPIRE_FEE           = 0.05     # 5% fee CSGOEmpire (ajusta conforme o teu tier)
-SCAN_INTERVAL        = 60       # segundos entre scans
+SCAN_INTERVAL        = 10      # segundos entre scans
 MAX_AUTO_BET_USD     = float(os.getenv("MAX_AUTO_BET_USD", "50"))  # cap por trade automático
 
 # Tags de mercados a monitorizar (Polymarket usa tags/categorias)
@@ -90,7 +90,9 @@ class PolymarketClient:
         next_cursor = None
         logger.info("A contactar Polymarket API...")
 
-        while True:
+        page = 0
+        while page < 5:  # máximo 5 páginas
+            page += 1
             params = {
                 "active": "true",
                 "closed": "false",
@@ -157,7 +159,11 @@ class PolymarketClient:
                     continue
 
             next_cursor = data.get("next_cursor")
-            if not next_cursor or next_cursor == "LTE=":
+            if not next_cursor or next_cursor == "LTE=" or next_cursor == "":
+                break
+            # Segurança: máximo 5 páginas (5000 mercados) para não ficar em loop
+            if len(markets) > 200 or (next_cursor and markets == []):
+                logger.info("Limite de paginação atingido, a parar")
                 break
 
         logger.info(f"Polymarket: {len(markets)} mercados elegíveis encontrados")
