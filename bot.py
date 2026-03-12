@@ -9,7 +9,7 @@ import aiohttp
 import logging
 import os
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -28,12 +28,12 @@ POLYMARKET_API_BASE = "https://clob.polymarket.com"
 CSGOEMPIRE_API_BASE = "https://csgoempire.com/api/v2"
 CSGOEMPIRE_API_KEY  = os.getenv("CSGOEMPIRE_API_KEY", "")
 
-MIN_POLY_VOLUME     = 10_000   # USD — volume mínimo Polymarket
-MIN_POLY_LIQUIDITY  = 10_000   # USD — liquidez mínima Polymarket
-MIN_EDGE            = 0.04     # 4% edge mínimo após fees
-POLY_FEE            = 0.02     # 2% fee Polymarket
-EMPIRE_FEE          = 0.05     # 5% fee CSGOEmpire
-SCAN_INTERVAL       = 30       # segundos entre scans
+MIN_POLY_VOLUME     = float(os.getenv("MIN_POLY_VOLUME", "10000"))
+MIN_POLY_LIQUIDITY  = float(os.getenv("MIN_POLY_LIQUIDITY", "10000"))
+MIN_EDGE            = 0.04
+POLY_FEE            = 0.02
+EMPIRE_FEE          = 0.05
+SCAN_INTERVAL       = 30
 
 # ─── DATA CLASSES ─────────────────────────────────────────────────────────────
 @dataclass
@@ -68,6 +68,17 @@ class ArbAlert:
     edge: float
 
 # ─── POLYMARKET CLIENT ────────────────────────────────────────────────────────
+def _get_float(m: dict, *keys) -> float:
+    """Tenta múltiplos nomes de campo e retorna o primeiro valor válido."""
+    for k in keys:
+        v = m.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                continue
+    return 0.0
+
 class PolymarketClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
@@ -75,6 +86,7 @@ class PolymarketClient:
     async def get_markets(self) -> list[PolyMarket]:
         markets = []
         page = 0
+        diagnosed = False
 
         while page < 5:
             page += 1
@@ -103,10 +115,23 @@ class PolymarketClient:
             if not raw:
                 break
 
+            # Log diagnóstico do primeiro mercado para perceber os campos disponíveis
+            if not diagnosed and raw:
+                diagnosed = True
+                sample = raw[0]
+                vol_fields = {k: v for k, v in sample.items()
+                              if any(x in k.lower() for x in ["vol", "liq", "price", "amount"])}
+                logger.info(f"Polymarket campos de valor: {vol_fields}")
+                logger.info(f"Polymarket todos os campos: {list(sample.keys())}")
+
             for m in raw:
                 try:
-                    volume    = float(m.get("volume", 0) or 0)
-                    liquidity = float(m.get("liquidity", 0) or 0)
+                    # Testar múltiplos nomes de campo possíveis
+                    volume    = _get_float(m, "volume", "volumeNum", "volume24hr",
+                                           "usd_volume", "total_volume", "notional_volume")
+                    liquidity = _get_float(m, "liquidity", "liquidityNum", "open_interest",
+                                           "usd_liquidity", "total_liquidity")
+
                     if volume < MIN_POLY_VOLUME or liquidity < MIN_POLY_LIQUIDITY:
                         continue
 
@@ -116,29 +141,30 @@ class PolymarketClient:
                     if not yes_token or not no_token:
                         continue
 
-                    yes_price = float(yes_token.get("price", 0) or 0)
-                    no_price  = float(no_token.get("price", 0) or 0)
+                    yes_price = _get_float(yes_token, "price")
+                    no_price  = _get_float(no_token, "price")
                     if yes_price <= 0 or no_price <= 0:
                         continue
 
-                    slug = m.get("market_slug", m.get("condition_id", ""))
+                    slug = m.get("market_slug", m.get("slug", m.get("condition_id", "")))
                     markets.append(PolyMarket(
-                        condition_id=m["condition_id"],
-                        question=m.get("question", ""),
+                        condition_id=m.get("condition_id", m.get("id", "")),
+                        question=m.get("question", m.get("title", "")),
                         yes_price=yes_price,
                         no_price=no_price,
                         volume=volume,
                         liquidity=liquidity,
                         url=f"https://polymarket.com/event/{slug}",
                     ))
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Mercado ignorado: {e}")
                     continue
 
             next_cursor = data.get("next_cursor", "")
             if not next_cursor or next_cursor in ("LTE=", ""):
                 break
 
-        logger.info(f"Polymarket: {len(markets)} mercados elegíveis")
+        logger.info(f"Polymarket: {len(markets)} mercados elegíveis (vol>={MIN_POLY_VOLUME}, liq>={MIN_POLY_LIQUIDITY})")
         return markets
 
 # ─── CSGOEMPIRE CLIENT ────────────────────────────────────────────────────────
@@ -148,7 +174,7 @@ class CSGOEmpireClient:
 
     async def get_events(self) -> list[EmpireEvent]:
         if not CSGOEMPIRE_API_KEY:
-            logger.info("CSGOEmpire: sem API key — a usar dados mock para teste")
+            logger.info("CSGOEmpire: sem API key — a usar dados mock")
             return self._mock_events()
 
         headers = {"Authorization": f"Bearer {CSGOEMPIRE_API_KEY}"}
@@ -193,7 +219,6 @@ class CSGOEmpireClient:
         return events
 
     def _mock_events(self) -> list[EmpireEvent]:
-        """Eventos de exemplo para testar o sistema de alertas."""
         return [
             EmpireEvent("1", "Manchester City", "Arsenal",    2.10, 3.50, 3.20, "football"),
             EmpireEvent("2", "Real Madrid",     "Barcelona",  2.40, 2.90, 3.10, "football"),
@@ -204,19 +229,13 @@ class CSGOEmpireClient:
         ]
 
 # ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
-def find_opportunities(
-    poly_markets: list[PolyMarket],
-    empire_events: list[EmpireEvent],
-) -> list[ArbAlert]:
+def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
     alerts = []
-
     for poly in poly_markets:
         q = poly.question.lower()
-
         for ev in empire_events:
             a = ev.team_a.lower()
             b = ev.team_b.lower()
-
             words_a = [w for w in a.split() if len(w) > 3]
             words_b = [w for w in b.split() if len(w) > 3]
             match_a = a in q or any(w in q for w in words_a)
@@ -228,30 +247,21 @@ def find_opportunities(
             pos_b = q.find(words_b[0]) if words_b and words_b[0] in q else 999
             yes_is_team_a = pos_a <= pos_b
 
-            combos = [
+            for poly_side, poly_price, empire_side, empire_odds in [
                 ("YES", poly.yes_price, "HOME", ev.odds_a if yes_is_team_a else ev.odds_b),
                 ("NO",  poly.no_price,  "AWAY", ev.odds_b if yes_is_team_a else ev.odds_a),
-            ]
-
-            for poly_side, poly_price, empire_side, empire_odds in combos:
+            ]:
                 if empire_odds <= 1:
                     continue
-
                 empire_implied = 1.0 / empire_odds
                 net_edge = (empire_implied - poly_price) - POLY_FEE - EMPIRE_FEE
-
                 if net_edge < MIN_EDGE:
                     continue
-
                 alerts.append(ArbAlert(
-                    poly_market=poly,
-                    empire_event=ev,
-                    poly_side=poly_side,
-                    empire_side=empire_side,
-                    poly_price=poly_price,
-                    empire_odds=empire_odds,
-                    empire_implied=empire_implied,
-                    edge=net_edge,
+                    poly_market=poly, empire_event=ev,
+                    poly_side=poly_side, empire_side=empire_side,
+                    poly_price=poly_price, empire_odds=empire_odds,
+                    empire_implied=empire_implied, edge=net_edge,
                 ))
 
     alerts.sort(key=lambda a: a.edge, reverse=True)
@@ -315,7 +325,7 @@ class ArbBot:
             await tg.send(
                 f"🤖 <b>Arbitrage Monitor Iniciado</b>\n"
                 f"⚠️ Modo: Só Alertas — trades manuais\n"
-                f"📊 Polymarket vol/liq mínimo: ${MIN_POLY_VOLUME:,}\n"
+                f"📊 Vol/Liq mínimo: ${MIN_POLY_VOLUME:,.0f}\n"
                 f"💹 Edge mínimo: {MIN_EDGE:.0%}\n"
                 f"🔄 Scan a cada {SCAN_INTERVAL}s"
             )
