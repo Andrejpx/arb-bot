@@ -1,6 +1,6 @@
 """
 Arbitrage Monitor Bot — Polymarket <-> CSGOEmpire
-Só mercados de Sports e Esports — partidas individuais e futures.
+Só mercados de Sports e Esports — partidas individuais.
 Alertas via Telegram — trades manuais.
 """
 
@@ -34,20 +34,21 @@ POLY_FEE      = 0.02
 EMPIRE_FEE    = 0.05
 SCAN_INTERVAL = 30
 
-# Slugs de desporto da Polymarket (retirados diretamente do site)
-SPORT_SLUGS = [
+# Palavras-chave que identificam mercados desportivos
+# Filtramos APÓS receber os dados, pela pergunta do mercado
+SPORT_KEYWORDS = [
+    # Equipas/jogadores — match direto
+    "vs", " v ", "beats", "wins", "win",
+    # Ligas e torneios
+    "epl", "premier league", "la liga", "bundesliga", "serie a", "ligue 1",
+    "champions league", "ucl", "uel", "nba", "nhl", "mls", "atp", "wta",
+    "mlb", "nfl", "ufc",
     # Esports
-    "counter-strike", "dota-2", "league-of-legends", "valorant",
-    "call-of-duty", "rainbow-six-siege",
-    # Futebol
-    "epl", "ucl", "laliga", "bundesliga", "sea", "ligue-1",
-    "mls", "por", "uel",
-    # Basketball
-    "nba",
-    # Tennis
-    "atp", "wta",
-    # Hockey
-    "nhl",
+    "cs2", "csgo", "counter-strike", "dota", "valorant", "league of legends",
+    "call of duty", "rainbow six",
+    # Desporto genérico
+    "match", "game", "fixture", "tournament", "playoff", "semifinal", "final",
+    "moneyline", "spread", "over", "under",
 ]
 
 # ─── DATA CLASSES ─────────────────────────────────────────────────────────────
@@ -85,15 +86,17 @@ class PolymarketClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    async def _fetch_slug(self, slug: str) -> list[dict]:
-        results = []
-        for offset in range(0, 500, 100):
+    async def get_markets(self) -> list[PolyMarket]:
+        all_raw = []
+        offset = 0
+
+        # Buscar mercados paginando até 1000
+        while offset < 1000:
             params = {
                 "active": "true",
                 "closed": "false",
                 "limit": 100,
                 "offset": offset,
-                "sport_slug": slug,
             }
             try:
                 async with self.session.get(
@@ -102,41 +105,37 @@ class PolymarketClient:
                     timeout=aiohttp.ClientTimeout(total=10, connect=5)
                 ) as resp:
                     if resp.status != 200:
+                        logger.warning(f"Polymarket HTTP {resp.status}")
                         break
                     raw = await resp.json()
                     if not raw:
                         break
-                    results.extend(raw)
+                    all_raw.extend(raw)
                     if len(raw) < 100:
                         break
+                    offset += 100
             except Exception as e:
-                logger.debug(f"Erro slug={slug}: {e}")
+                logger.error(f"Polymarket erro: {e}")
                 break
-        return results
 
-    async def get_markets(self) -> list[PolyMarket]:
-        # Buscar todos os slugs em paralelo
-        tasks = [self._fetch_slug(slug) for slug in SPORT_SLUGS]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"Polymarket: {len(all_raw)} mercados totais recebidos")
 
-        seen_ids = set()
-        all_raw = []
-        for r in results:
-            if isinstance(r, list):
-                for m in r:
-                    mid = str(m.get("id") or m.get("conditionId", ""))
-                    if mid and mid not in seen_ids:
-                        seen_ids.add(mid)
-                        all_raw.append(m)
+        # Filtrar por keywords desportivas
+        sport_markets_raw = []
+        for m in all_raw:
+            q = (m.get("question") or m.get("title") or "").lower()
+            if any(kw in q for kw in SPORT_KEYWORDS):
+                sport_markets_raw.append(m)
 
-        logger.info(f"Polymarket: {len(all_raw)} mercados Sports/Esports brutos")
+        logger.info(f"Polymarket: {len(sport_markets_raw)} mercados desportivos após filtro")
 
-        if all_raw:
-            questions = [m.get("question", "") for m in all_raw[:10]]
-            logger.info(f"Exemplos: {questions}")
+        # Log exemplos para diagnóstico
+        if sport_markets_raw:
+            examples = [m.get("question", "") for m in sport_markets_raw[:10]]
+            logger.info(f"Exemplos desportivos: {examples}")
 
         markets = []
-        for m in all_raw:
+        for m in sport_markets_raw:
             try:
                 outcome_prices = m.get("outcomePrices")
                 if isinstance(outcome_prices, str):
@@ -163,7 +162,7 @@ class PolymarketClient:
             except Exception as e:
                 logger.debug(f"Mercado ignorado: {e}")
 
-        logger.info(f"Polymarket: {len(markets)} mercados com preços válidos")
+        logger.info(f"Polymarket: {len(markets)} mercados desportivos com preços válidos")
         return markets
 
 # ─── CSGOEMPIRE CLIENT ────────────────────────────────────────────────────────
@@ -218,29 +217,21 @@ class CSGOEmpireClient:
         return events
 
     def _mock_events(self) -> list[EmpireEvent]:
-        """Eventos de teste baseados nos jogos disponíveis hoje na Polymarket."""
         return [
-            # Futebol
-            EmpireEvent("1",  "Fluminense",       "Vasco da Gama",    2.80, 2.50, 3.20, "football"),
-            EmpireEvent("2",  "Ferencvaros",       "Braga",            2.40, 2.90, 3.10, "football"),
-            EmpireEvent("3",  "Nottingham Forest", "Midtjylland",      1.80, 4.50, 3.80, "football"),
-            EmpireEvent("4",  "Bologna",           "Roma",             2.60, 2.70, 3.30, "football"),
-            EmpireEvent("5",  "Celta Vigo",        "Lyon",             2.20, 3.10, 3.00, "football"),
-            # Basketball
-            EmpireEvent("6",  "Rhode Island",      "Duquesne",         1.50, 2.60, None, "basketball"),
-            EmpireEvent("7",  "Nevada",            "Grand Canyon",     3.50, 1.35, None, "basketball"),
-            EmpireEvent("8",  "Ohio",              "Kent State",       1.80, 2.10, None, "basketball"),
-            # Tennis
-            EmpireEvent("9",  "Andreescu",         "Jones",            1.35, 3.20, None, "tennis"),
-            EmpireEvent("10", "Svitolina",         "Swiatek",          1.65, 2.30, None, "tennis"),
-            EmpireEvent("11", "Tien",              "Sinner",           3.80, 1.25, None, "tennis"),
-            # Esports CS2
-            EmpireEvent("12", "Vitality",          "NAVI",             1.85, 2.00, None, "csgo"),
-            EmpireEvent("13", "FaZe",              "G2",               2.20, 1.70, None, "csgo"),
-            EmpireEvent("14", "Astralis",          "Liquid",           2.10, 1.75, None, "csgo"),
-            # Dota 2
-            EmpireEvent("15", "Aurora",            "Team Yandex",      2.10, 1.75, None, "dota2"),
-            EmpireEvent("16", "Team Liquid",       "Tundra",           1.90, 1.95, None, "dota2"),
+            EmpireEvent("1",  "Fluminense",        "Vasco da Gama",    2.80, 2.50, 3.20, "football"),
+            EmpireEvent("2",  "Ferencvaros",        "Braga",            2.40, 2.90, 3.10, "football"),
+            EmpireEvent("3",  "Nottingham Forest",  "Midtjylland",      1.80, 4.50, 3.80, "football"),
+            EmpireEvent("4",  "Bologna",            "Roma",             2.60, 2.70, 3.30, "football"),
+            EmpireEvent("5",  "Celta Vigo",         "Lyon",             2.20, 3.10, 3.00, "football"),
+            EmpireEvent("6",  "Rhode Island",       "Duquesne",         1.50, 2.60, None, "basketball"),
+            EmpireEvent("7",  "Nevada",             "Grand Canyon",     3.50, 1.35, None, "basketball"),
+            EmpireEvent("8",  "Ohio",               "Kent State",       1.80, 2.10, None, "basketball"),
+            EmpireEvent("9",  "Andreescu",          "Jones",            1.35, 3.20, None, "tennis"),
+            EmpireEvent("10", "Svitolina",          "Swiatek",          1.65, 2.30, None, "tennis"),
+            EmpireEvent("11", "Tien",               "Sinner",           3.80, 1.25, None, "tennis"),
+            EmpireEvent("12", "Vitality",           "NAVI",             1.85, 2.00, None, "csgo"),
+            EmpireEvent("13", "Aurora",             "Team Yandex",      2.10, 1.75, None, "dota2"),
+            EmpireEvent("14", "Team Liquid",        "Tundra",           1.90, 1.95, None, "dota2"),
         ]
 
 # ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
@@ -249,7 +240,6 @@ def _team_in_question(team: str, question: str) -> bool:
     t = team.lower()
     if t in q:
         return True
-    # Palavras com mais de 3 letras
     words = [w for w in t.split() if len(w) > 3]
     return any(w in q for w in words)
 
@@ -291,7 +281,7 @@ def find_opportunities(poly_markets, empire_events) -> list[ArbAlert]:
     if matched:
         logger.info(f"Mercados com match ({len(matched)}): {matched[:5]}")
     else:
-        logger.info("Nenhum match encontrado")
+        logger.info("Nenhum match — eventos mock não correspondem aos mercados atuais")
 
     alerts.sort(key=lambda a: a.edge, reverse=True)
     logger.info(f"Oportunidades encontradas: {len(alerts)}")
@@ -353,7 +343,7 @@ class ArbBot:
             await tg.send(
                 f"🤖 <b>Arbitrage Monitor Iniciado</b>\n"
                 f"⚠️ Modo: Só Alertas — trades manuais\n"
-                f"🏆 Categorias: Futebol, Basketball, Tennis, NHL, CS2, Dota2, Valorant\n"
+                f"🏆 Sports + Esports (filtro por keywords)\n"
                 f"💹 Edge mínimo: {MIN_EDGE:.0%}\n"
                 f"🔄 Scan a cada {SCAN_INTERVAL}s"
             )
