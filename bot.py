@@ -37,7 +37,7 @@ MIN_POLY_LIQUIDITY   = 10_000   # USD — mínimo de liquidez exigida
 MIN_ARB_EDGE         = 0.04     # 4% edge mínimo após fees
 POLY_FEE             = 0.02     # 2% fee Polymarket
 EMPIRE_FEE           = 0.05     # 5% fee CSGOEmpire (ajusta conforme o teu tier)
-SCAN_INTERVAL        = 60       # segundos entre scans
+SCAN_INTERVAL        = 10      # segundos entre scans
 MAX_AUTO_BET_USD     = float(os.getenv("MAX_AUTO_BET_USD", "50"))  # cap por trade automático
 
 # Tags de mercados a monitorizar (Polymarket usa tags/categorias)
