@@ -24,12 +24,10 @@ logger = logging.getLogger(__name__)
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-POLYMARKET_API_BASE = "https://clob.polymarket.com"
-CSGOEMPIRE_API_BASE = "https://csgoempire.com/api/v2"
 CSGOEMPIRE_API_KEY  = os.getenv("CSGOEMPIRE_API_KEY", "")
+GAMMA_API_BASE      = "https://gamma-api.polymarket.com"
+CSGOEMPIRE_API_BASE = "https://csgoempire.com/api/v2"
 
-MIN_POLY_VOLUME     = float(os.getenv("MIN_POLY_VOLUME", "10000"))
-MIN_POLY_LIQUIDITY  = float(os.getenv("MIN_POLY_LIQUIDITY", "10000"))
 MIN_EDGE            = 0.04
 POLY_FEE            = 0.02
 EMPIRE_FEE          = 0.05
@@ -42,8 +40,6 @@ class PolyMarket:
     question: str
     yes_price: float
     no_price: float
-    volume: float
-    liquidity: float
     url: str = ""
 
 @dataclass
@@ -68,42 +64,35 @@ class ArbAlert:
     edge: float
 
 # ─── POLYMARKET CLIENT ────────────────────────────────────────────────────────
-def _get_float(m: dict, *keys) -> float:
-    """Tenta múltiplos nomes de campo e retorna o primeiro valor válido."""
-    for k in keys:
-        v = m.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                continue
-    return 0.0
-
 class PolymarketClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
     async def get_markets(self) -> list[PolyMarket]:
         markets = []
+        offset = 0
+        limit = 100
         page = 0
-        diagnosed = False
 
         while page < 5:
             page += 1
-            params = {"active": "true", "closed": "false", "limit": 100}
-            if page > 1:
-                params["offset"] = (page - 1) * 100
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": limit,
+                "offset": offset,
+            }
 
             try:
                 async with self.session.get(
-                    f"{POLYMARKET_API_BASE}/markets",
+                    f"{GAMMA_API_BASE}/markets",
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=10, connect=5)
                 ) as resp:
                     if resp.status != 200:
                         logger.warning(f"Polymarket HTTP {resp.status}")
                         break
-                    data = await resp.json()
+                    raw = await resp.json()
             except asyncio.TimeoutError:
                 logger.error("Polymarket timeout")
                 break
@@ -111,60 +100,48 @@ class PolymarketClient:
                 logger.error(f"Polymarket erro: {e}")
                 break
 
-            raw = data.get("data", [])
             if not raw:
                 break
 
-            # Log diagnóstico do primeiro mercado para perceber os campos disponíveis
-            if not diagnosed and raw:
-                diagnosed = True
-                sample = raw[0]
-                vol_fields = {k: v for k, v in sample.items()
-                              if any(x in k.lower() for x in ["vol", "liq", "price", "amount"])}
-                logger.info(f"Polymarket campos de valor: {vol_fields}")
-                logger.info(f"Polymarket todos os campos: {list(sample.keys())}")
+            if page == 1 and raw:
+                logger.info(f"Gamma campos disponíveis: {list(raw[0].keys())}")
 
             for m in raw:
                 try:
-                    # Testar múltiplos nomes de campo possíveis
-                    volume    = _get_float(m, "volume", "volumeNum", "volume24hr",
-                                           "usd_volume", "total_volume", "notional_volume")
-                    liquidity = _get_float(m, "liquidity", "liquidityNum", "open_interest",
-                                           "usd_liquidity", "total_liquidity")
+                    # Preços dos outcomes YES/NO
+                    outcome_prices = m.get("outcomePrices")
+                    if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+                        yes_price = float(outcome_prices[0])
+                        no_price  = float(outcome_prices[1])
+                    elif isinstance(outcome_prices, str):
+                        import json
+                        prices = json.loads(outcome_prices)
+                        yes_price = float(prices[0])
+                        no_price  = float(prices[1])
+                    else:
+                        yes_price = float(m.get("bestAsk") or m.get("lastTradePrice") or 0)
+                        no_price  = round(1 - yes_price, 4) if yes_price > 0 else 0
 
-                    if volume < MIN_POLY_VOLUME or liquidity < MIN_POLY_LIQUIDITY:
-                        continue
-
-                    tokens    = m.get("tokens", [])
-                    yes_token = next((t for t in tokens if t.get("outcome", "").upper() == "YES"), None)
-                    no_token  = next((t for t in tokens if t.get("outcome", "").upper() == "NO"), None)
-                    if not yes_token or not no_token:
-                        continue
-
-                    yes_price = _get_float(yes_token, "price")
-                    no_price  = _get_float(no_token, "price")
                     if yes_price <= 0 or no_price <= 0:
                         continue
 
-                    slug = m.get("market_slug", m.get("slug", m.get("condition_id", "")))
+                    slug = m.get("slug", str(m.get("id", "")))
                     markets.append(PolyMarket(
-                        condition_id=m.get("condition_id", m.get("id", "")),
+                        condition_id=str(m.get("conditionId", m.get("id", ""))),
                         question=m.get("question", m.get("title", "")),
                         yes_price=yes_price,
                         no_price=no_price,
-                        volume=volume,
-                        liquidity=liquidity,
                         url=f"https://polymarket.com/event/{slug}",
                     ))
                 except Exception as e:
                     logger.debug(f"Mercado ignorado: {e}")
                     continue
 
-            next_cursor = data.get("next_cursor", "")
-            if not next_cursor or next_cursor in ("LTE=", ""):
+            if len(raw) < limit:
                 break
+            offset += limit
 
-        logger.info(f"Polymarket: {len(markets)} mercados elegíveis (vol>={MIN_POLY_VOLUME}, liq>={MIN_POLY_LIQUIDITY})")
+        logger.info(f"Polymarket: {len(markets)} mercados encontrados")
         return markets
 
 # ─── CSGOEMPIRE CLIENT ────────────────────────────────────────────────────────
@@ -295,7 +272,6 @@ class Telegram:
             f"📊 <b>Polymarket</b>\n"
             f"  ❓ {alert.poly_market.question}\n"
             f"  🎯 Apostar <b>{alert.poly_side}</b> @ <b>{alert.poly_price:.3f}</b> ({alert.poly_price:.1%})\n"
-            f"  💰 Vol: <b>${alert.poly_market.volume:,.0f}</b> | Liq: <b>${alert.poly_market.liquidity:,.0f}</b>\n"
             f"  🔗 {alert.poly_market.url}\n\n"
             f"🎮 <b>CSGOEmpire</b>\n"
             f"  ⚔️ {alert.empire_event.team_a} vs {alert.empire_event.team_b}\n"
@@ -325,7 +301,6 @@ class ArbBot:
             await tg.send(
                 f"🤖 <b>Arbitrage Monitor Iniciado</b>\n"
                 f"⚠️ Modo: Só Alertas — trades manuais\n"
-                f"📊 Vol/Liq mínimo: ${MIN_POLY_VOLUME:,.0f}\n"
                 f"💹 Edge mínimo: {MIN_EDGE:.0%}\n"
                 f"🔄 Scan a cada {SCAN_INTERVAL}s"
             )
