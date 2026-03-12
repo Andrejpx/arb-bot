@@ -82,6 +82,7 @@ class PolymarketClient:
                 "closed": "false",
                 "limit": limit,
                 "offset": offset,
+                # sem filtro de tag — filtramos por keywords depois
             }
 
             try:
@@ -108,6 +109,8 @@ class PolymarketClient:
             if page == 1:
                 questions = [m.get("question", "") for m in raw[:10]]
                 logger.info(f"Primeiras perguntas Polymarket: {questions}")
+                tags_sample = list(set(t for m in raw[:20] for t in (m.get("tags") or [])))
+                logger.info(f"Tags disponíveis: {tags_sample[:20]}")
 
             for m in raw:
                 try:
@@ -123,6 +126,27 @@ class PolymarketClient:
                         no_price  = round(1 - yes_price, 4) if yes_price > 0 else 0
 
                     if yes_price <= 0 or no_price <= 0:
+                        continue
+
+                    # Filtrar por keywords desportivas na pergunta ou tags
+                    question_lower = m.get("question", "").lower()
+                    market_tags = [t.lower() for t in (m.get("tags") or [])]
+                    sport_keywords = [
+                        "win", "beat", "match", "game", "vs", "versus",
+                        "final", "champion", "league", "cup", "playoff",
+                        "nba", "nfl", "nhl", "mlb", "epl", "ucl",
+                        "soccer", "football", "basketball", "tennis", "golf",
+                        "esport", "cs2", "csgo", "dota", "valorant", "lol",
+                        "series", "tournament", "title", "score",
+                    ]
+                    sport_tags = ["sports", "esports", "soccer", "basketball",
+                                  "football", "tennis", "cs2", "csgo", "nba",
+                                  "nfl", "mls", "nhl", "baseball"]
+                    is_sport = (
+                        any(k in question_lower for k in sport_keywords)
+                        or any(t in market_tags for t in sport_tags)
+                    )
+                    if not is_sport:
                         continue
 
                     slug = m.get("slug", str(m.get("id", "")))
