@@ -1,6 +1,6 @@
 """
 Arbitrage Monitor Bot — Polymarket <-> The Odds API
-Compara preços da Polymarket com odds reais de bookmakers.
+Matching rigoroso: só mercados h2h reais, sem falsos positivos.
 Alertas via Telegram — trades manuais.
 """
 
@@ -10,8 +10,7 @@ import logging
 import os
 import json
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,11 +28,10 @@ ODDS_API_KEY     = os.getenv("ODDS_API_KEY", "55be989361b732d8ed74b8a3fed378fb")
 GAMMA_API_BASE   = "https://gamma-api.polymarket.com"
 ODDS_API_BASE    = "https://api.the-odds-api.com/v4"
 
-MIN_EDGE      = 0.03   # 3% edge mínimo
-POLY_FEE      = 0.02   # 2% fee Polymarket
-SCAN_INTERVAL = 60     # segundos entre scans
+MIN_EDGE      = 0.03
+POLY_FEE      = 0.02
+SCAN_INTERVAL = 60
 
-# Desportos a monitorizar na Odds API
 SPORT_KEYS = [
     "basketball_nba",
     "basketball_ncaab",
@@ -52,9 +50,6 @@ SPORT_KEYS = [
     "americanfootball_nfl",
     "baseball_mlb",
 ]
-
-# Bookmaker preferido para comparação (usa o melhor disponível)
-PREFERRED_BOOKMAKERS = ["pinnacle", "betfair_ex_eu", "betsson", "unibet_nl", "williamhill"]
 
 # ─── DATA CLASSES ─────────────────────────────────────────────────────────────
 @dataclass
@@ -81,13 +76,65 @@ class OddsEvent:
 class ArbAlert:
     poly_market: PolyMarket
     odds_event: OddsEvent
-    poly_side: str       # YES ou NO
-    bet_team: str        # nome da equipa a apostar na bookmaker
+    poly_side: str
+    bet_team: str
     poly_price: float
     book_odds: float
     book_implied: float
     bookmaker: str
     edge: float
+
+# ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
+# Palavras que não identificam uma equipa específica
+_NOISE = {
+    "the", "will", "win", "wins", "beat", "beats", "vs", "v",
+    "fc", "united", "city", "real", "sporting", "athletic",
+    "nba", "nhl", "nfl", "mlb", "epl", "atp", "wta",
+    "western", "eastern", "conference", "finals", "final",
+    "champion", "champions", "league", "cup", "series",
+    "playoff", "playoffs", "game", "match", "season",
+    "2026", "2025", "2024", "st", "san", "los", "las",
+    "new", "york", "de", "la", "el", "ac", "sc", "if",
+}
+
+# Mercados futures/outright — não são h2h, ignorar
+_FUTURES_KW = [
+    "win the nba", "win the nhl", "win the nfl", "win the mlb",
+    "win the epl", "win the league", "win the cup", "win the title",
+    "win la liga", "win bundesliga", "win serie a", "win ligue",
+    "championship", "champions league winner", "league winner",
+    "title winner", "most valuable", "mvp", "award",
+    "over/under", "total wins", "season wins", "first to",
+    "last to", "reach the finals", "advance to",
+]
+
+def _significant_words(text: str) -> set[str]:
+    words = text.lower().replace("?", "").replace(".", "").split()
+    return {w for w in words if w not in _NOISE and len(w) > 2}
+
+def _team_matches(team: str, question: str) -> bool:
+    q = question.lower()
+    t = team.lower()
+    # Match exato do nome completo
+    if t in q:
+        return True
+    # Todas as palavras significativas da equipa têm de estar na pergunta
+    sig = _significant_words(t)
+    if not sig:
+        return False
+    return all(w in q for w in sig)
+
+def _is_h2h_market(question: str) -> bool:
+    """Retorna True se parece um mercado h2h (jogo individual), não futures."""
+    q = question.lower()
+    if any(kw in q for kw in _FUTURES_KW):
+        return False
+    return True
+
+def teams_match_question(team_a: str, team_b: str, question: str) -> bool:
+    if not _is_h2h_market(question):
+        return False
+    return _team_matches(team_a, question) and _team_matches(team_b, question)
 
 # ─── POLYMARKET CLIENT ────────────────────────────────────────────────────────
 class PolymarketClient:
@@ -117,7 +164,6 @@ class PolymarketClient:
                 logger.error(f"Polymarket erro: {e}")
                 break
 
-        # Filtrar mercados desportivos por keywords
         SPORT_KW = [
             "vs", " v ", "wins", "win", "beats",
             "nba", "nhl", "nfl", "mlb", "epl", "premier league",
@@ -125,13 +171,12 @@ class PolymarketClient:
             "champions league", "ucl", "uel",
             "atp", "wta", "tennis",
             "cs2", "csgo", "counter-strike", "dota", "valorant",
-            "match", "game", "playoff", "semifinal", "final",
+            "match", "playoff", "semifinal",
         ]
         sport_raw = [
             m for m in all_raw
             if any(kw in (m.get("question") or "").lower() for kw in SPORT_KW)
         ]
-
         logger.info(f"Polymarket: {len(all_raw)} total → {len(sport_raw)} desportivos")
 
         markets = []
@@ -168,9 +213,7 @@ class OddsAPIClient:
         self.session = session
 
     def _best_odds(self, bookmakers: list, team_name: str) -> tuple[float, str]:
-        """Retorna as melhores odds para uma equipa entre todos os bookmakers."""
-        best_odds = 0.0
-        best_book = ""
+        best_odds, best_book = 0.0, ""
         for bm in bookmakers:
             for market in bm.get("markets", []):
                 if market.get("key") != "h2h":
@@ -199,26 +242,21 @@ class OddsAPIClient:
                     timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     if resp.status == 422:
-                        logger.debug(f"Odds API: sport {sport_key} não disponível")
                         continue
                     if resp.status != 200:
-                        logger.warning(f"Odds API HTTP {resp.status} para {sport_key}")
+                        logger.warning(f"Odds API {resp.status} para {sport_key}")
                         continue
                     data = await resp.json()
 
                 for ev in data:
-                    home = ev["home_team"]
-                    away = ev["away_team"]
-                    bms  = ev.get("bookmakers", [])
+                    home, away = ev["home_team"], ev["away_team"]
+                    bms = ev.get("bookmakers", [])
                     if not bms:
                         continue
-
                     odds_home, book_home = self._best_odds(bms, home)
                     odds_away, book_away = self._best_odds(bms, away)
-
                     if odds_home <= 1.0 or odds_away <= 1.0:
                         continue
-
                     events.append(OddsEvent(
                         event_id=ev["id"],
                         sport=sport_key,
@@ -230,47 +268,38 @@ class OddsAPIClient:
                         best_bookmaker_home=book_home,
                         best_bookmaker_away=book_away,
                     ))
-
-                await asyncio.sleep(0.3)  # respeitar rate limits
-
+                await asyncio.sleep(0.3)
             except Exception as e:
                 logger.error(f"Odds API erro ({sport_key}): {e}")
 
-        logger.info(f"Odds API: {len(events)} eventos com odds reais")
+        logger.info(f"Odds API: {len(events)} eventos")
         return events
 
-# ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
-def _team_in_question(team: str, question: str) -> bool:
-    q = question.lower()
-    t = team.lower()
-    if t in q:
-        return True
-    # Palavras com mais de 3 letras
-    words = [w for w in t.split() if len(w) > 3]
-    return any(w in q for w in words)
-
+# ─── FIND OPPORTUNITIES ───────────────────────────────────────────────────────
 def find_opportunities(poly_markets: list[PolyMarket], odds_events: list[OddsEvent]) -> list[ArbAlert]:
     alerts = []
     matched_count = 0
 
     for poly in poly_markets:
         for ev in odds_events:
-            home_match = _team_in_question(ev.home_team, poly.question)
-            away_match = _team_in_question(ev.away_team, poly.question)
-
-            if not (home_match and away_match):
+            if not teams_match_question(ev.home_team, ev.away_team, poly.question):
                 continue
 
             matched_count += 1
 
             # Determinar qual equipa o YES representa
             q = poly.question.lower()
-            pos_home = min((q.find(w) for w in ev.home_team.lower().split() if len(w) > 3 and w in q), default=999)
-            pos_away = min((q.find(w) for w in ev.away_team.lower().split() if len(w) > 3 and w in q), default=999)
+            pos_home = min(
+                (q.find(w) for w in _significant_words(ev.home_team.lower()) if w in q),
+                default=999
+            )
+            pos_away = min(
+                (q.find(w) for w in _significant_words(ev.away_team.lower()) if w in q),
+                default=999
+            )
             yes_is_home = pos_home <= pos_away
 
-            checks = [
-                # (poly_side, poly_price, bet_team, book_odds, bookmaker)
+            for poly_side, poly_price, bet_team, book_odds, bookmaker in [
                 (
                     "YES", poly.yes_price,
                     ev.home_team if yes_is_home else ev.away_team,
@@ -283,29 +312,22 @@ def find_opportunities(poly_markets: list[PolyMarket], odds_events: list[OddsEve
                     ev.best_odds_away if yes_is_home else ev.best_odds_home,
                     ev.best_bookmaker_away if yes_is_home else ev.best_bookmaker_home,
                 ),
-            ]
-
-            for poly_side, poly_price, bet_team, book_odds, bookmaker in checks:
+            ]:
                 if book_odds <= 1.0:
                     continue
                 book_implied = 1.0 / book_odds
-                # Edge: bookmaker acha que é mais provável do que Polymarket cobra
                 net_edge = (book_implied - poly_price) - POLY_FEE
                 if net_edge < MIN_EDGE:
                     continue
                 alerts.append(ArbAlert(
-                    poly_market=poly,
-                    odds_event=ev,
-                    poly_side=poly_side,
-                    bet_team=bet_team,
-                    poly_price=poly_price,
-                    book_odds=book_odds,
-                    book_implied=book_implied,
-                    bookmaker=bookmaker,
+                    poly_market=poly, odds_event=ev,
+                    poly_side=poly_side, bet_team=bet_team,
+                    poly_price=poly_price, book_odds=book_odds,
+                    book_implied=book_implied, bookmaker=bookmaker,
                     edge=net_edge,
                 ))
 
-    logger.info(f"Matches encontrados: {matched_count} | Oportunidades: {len(alerts)}")
+    logger.info(f"Matches: {matched_count} | Oportunidades: {len(alerts)}")
     alerts.sort(key=lambda a: a.edge, reverse=True)
     return alerts
 
@@ -325,8 +347,7 @@ class Telegram:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"Telegram erro {resp.status}: {body}")
+                    logger.warning(f"Telegram erro {resp.status}")
         except Exception as e:
             logger.error(f"Telegram erro: {e}")
 
@@ -336,7 +357,6 @@ class Telegram:
             "tennis": "🎾", "americanfootball": "🏈", "baseball": "⚾",
         }
         emoji = next((v for k, v in sport_emoji.items() if k in alert.odds_event.sport), "🏆")
-
         return (
             f"🚨 <b>OPORTUNIDADE ARB DETETADA</b> {emoji}\n\n"
             f"📊 <b>Polymarket</b>\n"
@@ -363,13 +383,13 @@ class ArbBot:
     async def run(self):
         logger.info("🚀 Arbitrage Bot iniciado")
         async with aiohttp.ClientSession() as session:
-            poly   = PolymarketClient(session)
-            odds   = OddsAPIClient(session)
-            tg     = Telegram(session)
+            poly = PolymarketClient(session)
+            odds = OddsAPIClient(session)
+            tg   = Telegram(session)
 
             await tg.send(
                 f"🤖 <b>Arbitrage Monitor Iniciado</b>\n"
-                f"✅ Odds reais via The Odds API\n"
+                f"✅ Matching rigoroso — sem falsos positivos\n"
                 f"🏆 NBA, NHL, EPL, UCL, Tennis, NFL, MLB...\n"
                 f"💹 Edge mínimo: {MIN_EDGE:.0%}\n"
                 f"🔄 Scan a cada {SCAN_INTERVAL}s"
@@ -394,8 +414,6 @@ class ArbBot:
 
                     if new == 0:
                         logger.info("Nenhuma oportunidade nova")
-                    else:
-                        logger.info(f"{new} alertas enviados")
 
                     if len(self.seen) > 2000:
                         self.seen.clear()
