@@ -32,7 +32,7 @@ ODDSPAPI_BASE    = "https://api.oddspapi.io/v4"
 
 MIN_EDGE      = 0.03
 POLY_FEE      = 0.02
-SCAN_INTERVAL = 60
+SCAN_INTERVAL = 10
 
 # ── OddsPapi Sport IDs ──
 SPORT_FOOTBALL  = 10
@@ -373,7 +373,7 @@ class OddsPapiClient:
                 async with self.session.get(
                     f"{ODDSPAPI_BASE}/fixtures",
                     params={"apiKey": ODDSPAPI_KEY, "sportId": sport_id,
-                            "from": today, "to": week, "hasOdds": True},
+                            "from": today, "to": week, "hasOdds": True, "statusId": "0,1,2"},
                     timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     if resp.status != 200:
@@ -574,10 +574,24 @@ class Telegram:
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 class ArbBot:
     def __init__(self):
-        self.seen: set[str] = set()
+        # key -> (edge_registado, timestamp_ultimo_alerta)
+        self.seen: dict[str, tuple[float, float]] = {}
 
     def _key(self, a: ArbAlert) -> str:
         return f"{a.poly_market.condition_id}_{a.odds_event.event_id}_{a.poly_side}"
+
+    def _should_alert(self, key: str, new_edge: float) -> bool:
+        import time
+        now = time.time()
+        if key not in self.seen:
+            return True
+        old_edge, last_ts = self.seen[key]
+        # Realertar se edge melhorou >1.5% OU passaram >5 minutos
+        if new_edge - old_edge >= 0.015:
+            return True
+        if now - last_ts >= 300:
+            return True
+        return False
 
     async def run(self):
         logger.info("🚀 Bot iniciado")
@@ -629,12 +643,13 @@ class ArbBot:
 
                     opportunities = find_opportunities(poly_markets, all_events)
 
+                    import time
                     new = 0
                     for alert in opportunities:
                         key = self._key(alert)
-                        if key in self.seen:
+                        if not self._should_alert(key, alert.edge):
                             continue
-                        self.seen.add(key)
+                        self.seen[key] = (alert.edge, time.time())
                         new += 1
                         await tg.send(tg.format_alert(alert))
                         await asyncio.sleep(1)
